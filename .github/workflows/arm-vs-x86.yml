@@ -1,0 +1,92 @@
+name: OpenSees on Arm vs x86
+
+on:
+  push:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # weekly re-check against the latest OpenSees source
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine information
+        run: |
+          uname -m
+          lscpu | grep -E "Architecture|Model name|Vendor ID|^CPU\(s\)|Flags" | cut -c1-200
+          grep PRETTY_NAME /etc/os-release
+          python3 --version
+
+      - name: Install build dependencies (no Intel MKL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc g++ gfortran python3-dev python3-venv liblapack-dev libopenblas-dev file
+
+      - name: Install Conan 2
+        run: |
+          python3 -m venv "$HOME/ops"
+          source "$HOME/ops/bin/activate"
+          pip install --upgrade pip conan
+          conan profile detect --force
+          echo "$HOME/ops/bin" >> "$GITHUB_PATH"
+
+      - name: Get OpenSees source
+        run: |
+          git clone --depth 1 https://github.com/OpenSees/OpenSees.git
+          git -C OpenSees log -1 --format="OpenSees commit %h (%cd)" | tee opensees-commit.txt
+
+      - name: Build with the official makeUbuntu.sh script
+        working-directory: OpenSees
+        run: bash makeUbuntu.sh
+
+      - name: Collect binaries
+        run: |
+          mkdir -p dist
+          PY=$(find OpenSees/build -name "OpenSeesPy.so" -type f | head -1)
+          TCL=$(find OpenSees/build -name "OpenSees" -type f -perm -u+x | head -1)
+          echo "OpenSeesPy: $PY"; echo "OpenSees (Tcl): $TCL"
+          cp "$PY" dist/opensees.so
+          cp "$TCL" dist/OpenSees
+          file dist/opensees.so dist/OpenSees
+          ldd dist/opensees.so | grep -v -E "linux-vdso|ld-linux" || true
+
+      - name: Tcl smoke test
+        run: ./dist/OpenSees tests/smoke.tcl
+
+      - name: Python test models
+        run: PYTHONPATH="$PWD/dist" python3 tests/run_tests.py "results-${{ runner.arch }}.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opensees-${{ runner.arch }}
+          path: |
+            results-*.json
+            opensees-commit.txt
+            dist/
+
+  compare:
+    needs: build-and-test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+      - name: Compare Arm and x86 results
+        run: |
+          {
+            echo '## OpenSees: Arm (aarch64) vs x86-64'
+            cat opensees-X64/opensees-commit.txt
+            echo '```'
+            python3 tests/compare.py opensees-X64/results-X64.json opensees-ARM64/results-ARM64.json
+            echo '```'
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md
+          python3 tests/compare.py opensees-X64/results-X64.json opensees-ARM64/results-ARM64.json > /dev/null
